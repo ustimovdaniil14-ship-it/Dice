@@ -16,9 +16,7 @@ from aiogram.types import ChatPermissions, Message
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise SystemExit("Не задана переменная окружения BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN", "1780243245:OgkJlwaJOao3C1gi41Jt2rfO8jpvFM26u1V")
 # Для приватки: адрес её Bot API, например https://bot.example.lol
 # Если обычный Telegram - оставь пустым.
 API_BASE = os.getenv("API_BASE", "http://botapi-31-77-10-54.nip.io")
@@ -236,6 +234,17 @@ class FreezeMiddleware(BaseMiddleware):
 
 
 router.message.outer_middleware(FreezeMiddleware())
+
+
+UPDATES = {}  # тип обновления -> сколько пришло
+
+
+class UpdateLogger(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        t = event.event_type if hasattr(event, "event_type") else type(event).__name__
+        UPDATES[t] = UPDATES.get(t, 0) + 1
+        logging.info("UPDATE type=%s raw=%s", t, str(event.model_dump(exclude_none=True))[:300])
+        return await handler(event, data)
 
 
 # ---------- команды ----------
@@ -500,10 +509,15 @@ async def cmd_apicheck(message: Message, bot: Bot):
         lines.append("\n✅ живой тест: отправил и удалил сообщение")
     except Exception as e:
         lines.append(f"\n❌ живой тест удаления: {e!r}")
+    try:
+        me = await bot.get_me()
+        lines.append(f"\ncan_read_all_group_messages: {getattr(me, 'can_read_all_group_messages', None)}")
+    except Exception as e:
+        lines.append(f"\ngetMe: {e!r}")
     lines.append(
         f"\nвидел сообщений: {STATS['seen']}, удалил: {STATS['deleted']}, "
         f"ошибок удаления: {STATS['delete_errors']}\nпоследняя ошибка: {STATS['last_error']}\n"
-        f"заморожено: {len(FROZEN)}"
+        f"заморожено: {len(FROZEN)}\nобновления по типам: {UPDATES}"
     )
     await message.reply("\n".join(lines))
 
@@ -549,8 +563,12 @@ async def main():
         bot = Bot(TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+    dp.update.outer_middleware(UpdateLogger())
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await dp.start_polling(
+        bot,
+        allowed_updates=["message", "edited_message", "channel_post", "my_chat_member", "chat_member", "callback_query"],
+    )
 
 
 if __name__ == "__main__":
