@@ -6,16 +6,19 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramNotFound
 from aiogram.filters import Command, CommandObject
 from aiogram.types import ChatPermissions, Message
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("BOT_TOKEN", "1780243245:OgkJlwaJOao3C1gi41Jt2rfO8jpvFM26u1V")
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise SystemExit("Не задана переменная окружения BOT_TOKEN")
 # Для приватки: адрес её Bot API, например https://bot.example.lol
 # Если обычный Telegram - оставь пустым.
 API_BASE = os.getenv("API_BASE", "http://botapi-31-77-10-54.nip.io")
@@ -159,21 +162,80 @@ FULL_RIGHTS = ChatPermissions(
 
 # Программный фриз: если в приватке нет restrictChatMember,
 # бот сам удаляет сообщения замороженных (нужен deleteMessage).
-FROZEN: dict = {}
+FROZEN_FILE = "frozen.json"
+try:
+    with open(FROZEN_FILE, "r", encoding="utf-8") as f:
+        FROZEN: dict = json.load(f)
+except Exception:
+    FROZEN = {}
+
+STATS = {"seen": 0, "deleted": 0, "delete_errors": 0, "last_error": "-"}
 
 
-async def restrict(bot: Bot, chat_id: int, uid: int, td: timedelta | None):
+def save_frozen():
+    try:
+        with open(FROZEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(FROZEN, f)
+    except Exception as e:
+        logging.warning("не удалось сохранить frozen.json: %r", e)
+
+
+def not_supported(e: Exception) -> bool:
+    """Метод в приватке отсутствует (а не просто 'нет прав')."""
+    return isinstance(e, TelegramNotFound) or "METHOD_NOT_FOUND" in str(e).upper()
+
+
+def soft_freeze(chat_id: int, uid: int, until):
+    FROZEN[wkey(chat_id, uid)] = until.timestamp() if until else 0
+    save_frozen()
+
+
+async def restrict(bot: Bot, chat_id: int, uid: int, td: timedelta | None) -> str:
+    """Возвращает 'native' или 'soft' (программный фриз)."""
     until = datetime.now(timezone.utc) + td if td else None
     try:
         await bot.restrict_chat_member(
             chat_id, uid, permissions=NO_RIGHTS, until_date=until
         )
+        return "native"
     except Exception as e:
-        if "METHOD_NOT_FOUND" in str(e):
-            FROZEN[wkey(chat_id, uid)] = until.timestamp() if until else 0
-            logging.warning("restrictChatMember не поддерживается, включён программный фриз")
-            return
+        if not_supported(e):
+            soft_freeze(chat_id, uid, until)
+            logging.warning("restrictChatMember не поддерживается, программный фриз для %s", uid)
+            return "soft"
         raise
+
+
+SOFT_NOTE = "\n<i>(программный режим: бот удаляет сообщения)</i>"
+
+
+class FreezeMiddleware(BaseMiddleware):
+    """Работает на КАЖДОЕ сообщение (в т.ч. команды): удаляет сообщения замороженных."""
+
+    async def __call__(self, handler, event: Message, data):
+        STATS["seen"] += 1
+        u = event.from_user
+        logging.info("msg chat=%s from=%s text=%r", event.chat.id, u.id if u else None, (event.text or "")[:40])
+        if u:
+            k = wkey(event.chat.id, u.id)
+            if k in FROZEN:
+                until = FROZEN[k]
+                if until and until < time.time():
+                    FROZEN.pop(k, None)
+                    save_frozen()
+                else:
+                    try:
+                        await event.delete()
+                        STATS["deleted"] += 1
+                    except Exception as e:
+                        STATS["delete_errors"] += 1
+                        STATS["last_error"] = repr(e)
+                        logging.warning("не удалось удалить сообщение: %r", e)
+                    return
+        return await handler(event, data)
+
+
+router.message.outer_middleware(FreezeMiddleware())
 
 
 # ---------- команды ----------
@@ -218,12 +280,13 @@ async def cmd_freeze(message: Message, command: CommandObject, bot: Bot):
         return
     reason = " ".join(rest[1:]) or "не указана"
     try:
-        await restrict(bot, message.chat.id, uid, td)
+        mode = await restrict(bot, message.chat.id, uid, td)
     except Exception as e:
         await message.reply(f"Не вышло: {e}")
         return
     await message.reply(
-        f"🧊 {mention(uid, name)} заморожен на <b>{human(td)}</b>\nПричина: {reason}",
+        f"🧊 {mention(uid, name)} заморожен на <b>{human(td)}</b>\nПричина: {reason}"
+        + (SOFT_NOTE if mode == "soft" else ""),
         parse_mode="HTML",
     )
 
@@ -237,10 +300,11 @@ async def cmd_unfreeze(message: Message, command: CommandObject, bot: Bot):
         return
     uid, name, _ = t
     FROZEN.pop(wkey(message.chat.id, uid), None)
+    save_frozen()
     try:
         await bot.restrict_chat_member(message.chat.id, uid, permissions=FULL_RIGHTS)
     except Exception as e:
-        if "METHOD_NOT_FOUND" not in str(e):
+        if not not_supported(e):
             await message.reply(f"Не вышло: {e}")
             return
     await message.reply(f"✅ С {mention(uid, name)} сняты ограничения", parse_mode="HTML")
@@ -258,13 +322,14 @@ async def cmd_mute(message: Message, command: CommandObject, bot: Bot):
     reason_parts = rest[1:] if td else rest
     reason = " ".join(reason_parts) or "не указана"
     try:
-        await restrict(bot, message.chat.id, uid, td)
+        mode = await restrict(bot, message.chat.id, uid, td)
     except Exception as e:
         await message.reply(f"Не вышло: {e}")
         return
     срок = human(td) if td else "навсегда"
     await message.reply(
-        f"🔇 {mention(uid, name)} в муте: <b>{срок}</b>\nПричина: {reason}",
+        f"🔇 {mention(uid, name)} в муте: <b>{срок}</b>\nПричина: {reason}"
+        + (SOFT_NOTE if mode == "soft" else ""),
         parse_mode="HTML",
     )
 
@@ -283,12 +348,18 @@ async def cmd_ban(message: Message, command: CommandObject, bot: Bot):
     until = datetime.now(timezone.utc) + td if td else None
     try:
         await bot.ban_chat_member(message.chat.id, uid, until_date=until)
+        soft = False
     except Exception as e:
-        await message.reply(f"Не вышло: {e}")
-        return
+        if not_supported(e):
+            soft_freeze(message.chat.id, uid, until)
+            soft = True
+        else:
+            await message.reply(f"Не вышло: {e}")
+            return
     срок = human(td) if td else "навсегда"
     await message.reply(
-        f"⛔ {mention(uid, name)} забанен: <b>{срок}</b>\nПричина: {reason}",
+        f"⛔ {mention(uid, name)} забанен: <b>{срок}</b>\nПричина: {reason}"
+        + ("\n<i>banChatMember нет в приватке: бот просто удаляет все сообщения этого человека</i>" if soft else ""),
         parse_mode="HTML",
     )
 
@@ -326,7 +397,10 @@ async def cmd_kick(message: Message, command: CommandObject, bot: Bot):
         await bot.ban_chat_member(message.chat.id, uid)
         await bot.unban_chat_member(message.chat.id, uid)
     except Exception as e:
-        await message.reply(f"Не вышло: {e}")
+        if not_supported(e):
+            await message.reply("В этой приватке нет banChatMember, кик невозможен.")
+        else:
+            await message.reply(f"Не вышло: {e}")
         return
     await message.reply(
         f"👢 {mention(uid, name)} выгнан\nПричина: {reason}", parse_mode="HTML"
@@ -419,25 +493,19 @@ async def cmd_apicheck(message: Message, bot: Bot):
             except Exception:
                 ok = False
             lines.append(("✅ " if ok else "❌ ") + m)
-    await message.reply("\n".join(lines))
-
-
-@router.message()
-async def watcher(message: Message, bot: Bot):
-    """Удаляет сообщения тех, кто заморожен программно."""
-    if not message.from_user:
-        return
-    k = wkey(message.chat.id, message.from_user.id)
-    if k not in FROZEN:
-        return
-    until = FROZEN[k]
-    if until and until < time.time():
-        FROZEN.pop(k, None)
-        return
+    # живой тест: реально ли бот может удалять сообщения
     try:
-        await message.delete()
+        probe = await bot.send_message(message.chat.id, "тест удаления...")
+        await probe.delete()
+        lines.append("\n✅ живой тест: отправил и удалил сообщение")
     except Exception as e:
-        logging.warning("не удалось удалить сообщение: %r", e)
+        lines.append(f"\n❌ живой тест удаления: {e!r}")
+    lines.append(
+        f"\nвидел сообщений: {STATS['seen']}, удалил: {STATS['deleted']}, "
+        f"ошибок удаления: {STATS['delete_errors']}\nпоследняя ошибка: {STATS['last_error']}\n"
+        f"заморожено: {len(FROZEN)}"
+    )
+    await message.reply("\n".join(lines))
 
 
 # ---------- веб-сервер для Render / UptimeRobot ----------
