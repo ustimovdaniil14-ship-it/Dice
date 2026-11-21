@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: moderbot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mod_bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_BASE
+        value: http://botapi-31-77-10-54.nip.io
