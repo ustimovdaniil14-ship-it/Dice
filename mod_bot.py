@@ -14,7 +14,7 @@ from aiogram.types import ChatPermissions, Message
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("BOT_TOKEN", "1780243245:OgkJlwaJ0ao3C1gi41Jt2rf08jpvFM26u1V")
+TOKEN = os.getenv("BOT_TOKEN", "1780243245:OgkJlwaJOao3C1gi41Jt2rfO8jpvFM26u1V")
 # Для приватки: адрес её Bot API, например https://bot.example.lol
 # Если обычный Telegram - оставь пустым.
 API_BASE = os.getenv("API_BASE", "http://botapi-31-77-10-54.nip.io")
@@ -381,9 +381,26 @@ async def start_web():
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080))).start()
 
 
+async def keep_alive():
+    """Сам себя пингует каждые 10 минут, чтобы бесплатный Render не засыпал."""
+    import aiohttp
+
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with aiohttp.ClientSession() as s:
+                await s.get(url, timeout=aiohttp.ClientTimeout(total=20))
+        except Exception:
+            pass
+
+
 # ---------- запуск ----------
 async def main():
     await start_web()
+    asyncio.create_task(keep_alive())
     if API_BASE:
         session = AiohttpSession(api=TelegramAPIServer.from_base(API_BASE))
         bot = Bot(TOKEN, session=session)
