@@ -77,11 +77,21 @@ def mention(uid: int, name: str) -> str:
     return f'<a href="tg://user?id={uid}">{safe}</a>'
 
 
+# Запасной список админов по ID (через запятую), например: ADMIN_IDS=123,456
+ADMIN_IDS = {
+    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.lstrip("-").isdigit()
+}
+
+
 async def is_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
     try:
         m = await bot.get_chat_member(chat_id, user_id)
-        return m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
-    except Exception:
+        status = str(getattr(m.status, "value", m.status)).lower()
+        return status in ("administrator", "creator", "owner")
+    except Exception as e:
+        logging.warning("get_chat_member failed for %s: %r", user_id, e)
         return False
 
 
@@ -90,7 +100,7 @@ async def check_access(message: Message, bot: Bot) -> bool:
         await message.reply("Эта команда работает только в чате.")
         return False
     if not await is_admin(bot, message.chat.id, message.from_user.id):
-        await message.reply("Только для админов.")
+        await message.reply(f"Только для админов. Твой ID: {message.from_user.id}")
         return False
     return True
 
