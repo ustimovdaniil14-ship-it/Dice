@@ -79,7 +79,7 @@ def mention(uid: int, name: str) -> str:
 
 # Запасной список админов по ID (через запятую), например: ADMIN_IDS=123,456
 ADMIN_IDS = {
-    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.lstrip("-").isdigit()
+    int(x) for x in os.getenv("ADMIN_IDS", "1780243219,1780243206").replace(" ", "").split(",") if x.lstrip("-").isdigit()
 }
 
 
