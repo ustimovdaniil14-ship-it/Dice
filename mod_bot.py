@@ -522,6 +522,82 @@ async def cmd_apicheck(message: Message, bot: Bot):
     await message.reply("\n".join(lines))
 
 
+@router.message(Command("deltest"))
+async def cmd_deltest(message: Message, bot: Bot):
+    """Пробует разные форматы deleteMessage и показывает сырой ответ приватки."""
+    if not await check_access(message, bot):
+        return
+    import aiohttp
+
+    base = API_BASE.rstrip("/") if API_BASE else "https://api.telegram.org"
+    cid = message.chat.id
+    raw_cid = str(cid)
+    variants = [
+        ("deleteMessage json int", "deleteMessage", lambda m: {"chat_id": cid, "message_id": m}),
+        ("deleteMessage json str", "deleteMessage", lambda m: {"chat_id": str(cid), "message_id": str(m)}),
+        ("deleteMessages json", "deleteMessages", lambda m: {"chat_id": cid, "message_ids": [m]}),
+        ("deleteMessage без -100", "deleteMessage", lambda m: {"chat_id": int(raw_cid.replace("-100", "-", 1)), "message_id": m}),
+        ("deleteMessage chat_id>0", "deleteMessage", lambda m: {"chat_id": abs(int(raw_cid[4:] or 0)) if raw_cid.startswith("-100") else abs(cid), "message_id": m}),
+    ]
+    out = [f"chat_id = {cid}"]
+    async with aiohttp.ClientSession() as s:
+        for title, method, build in variants:
+            probe = await bot.send_message(cid, f"probe: {title}")
+            try:
+                async with s.post(
+                    f"{base}/bot{TOKEN}/{method}", json=build(probe.message_id),
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    txt = (await r.text())[:150]
+                out.append(f"{r.status} {title}: {txt}")
+            except Exception as e:
+                out.append(f"ERR {title}: {e!r}")
+    out.append("\nКакие probe-сообщения остались в чате - те варианты не сработали.")
+    await message.reply("\n".join(out))
+
+
+@router.message(Command("apiscan"))
+async def cmd_apiscan(message: Message, bot: Bot):
+    """Перебирает возможные названия методов и показывает существующие + страницы документации."""
+    if not await check_access(message, bot):
+        return
+    import aiohttp
+
+    base = API_BASE.rstrip("/") if API_BASE else "https://api.telegram.org"
+    names = """getMe getChat getChatMember getChatMembers getChatMemberCount getChatMembersCount getChatAdministrators
+    restrictChatMember restrictMember muteChatMember muteMember mutechatmember setChatMemberPermissions setChatMemberRestrictions
+    setChatPermissions banChatMember banMember kickChatMember kickMember removeChatMember removeMember unbanChatMember unbanMember
+    banChatSenderChat unbanChatSenderChat promoteChatMember setChatAdministratorCustomTitle
+    deleteMessage deleteMessages deleteChatMessages deleteMessagesFrom deleteHistory deleteUserMessages
+    leaveChat setChatTitle setChatDescription pinChatMessage unpinChatMessage
+    createChatInviteLink exportChatInviteLink approveChatJoinRequest declineChatJoinRequest
+    getUpdates setMyCommands getMyCommands getWebhookInfo sendMessage forwardMessage copyMessage
+    editMessageText getFile getUserProfilePhotos getChatMenuButton""".split()
+    found, missing = [], 0
+    async with aiohttp.ClientSession() as s:
+        async def probe(n):
+            try:
+                async with s.post(f"{base}/bot{TOKEN}/{n}", json={}, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    t = (await r.text())[:60].replace("\n", " ")
+                if r.status == 404 or "METHOD_NOT_FOUND" in t.upper():
+                    return None
+                return f"✅ {n}: {r.status} {t}"
+            except Exception as e:
+                return None
+        res = await asyncio.gather(*(probe(n) for n in names))
+        found = [x for x in res if x]
+        docs = []
+        for path in ("/", "/docs", "/openapi.json", "/methods", "/help", "/api", "/swagger"):
+            try:
+                async with s.get(base + path, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    if r.status == 200:
+                        docs.append(f"{path} -> 200 ({r.headers.get('content-type', '?')[:30]})")
+            except Exception:
+                pass
+    text = "Существуют:\n" + "\n".join(found) + "\n\nСтраницы сервера:\n" + ("\n".join(docs) or "нет")
+    await message.reply(text[:4000])
+
+
 # ---------- веб-сервер для Render / UptimeRobot ----------
 async def start_web():
     from aiohttp import web
