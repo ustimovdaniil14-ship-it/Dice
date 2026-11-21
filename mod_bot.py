@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, Router
@@ -156,11 +157,23 @@ FULL_RIGHTS = ChatPermissions(
 )
 
 
+# Программный фриз: если в приватке нет restrictChatMember,
+# бот сам удаляет сообщения замороженных (нужен deleteMessage).
+FROZEN: dict = {}
+
+
 async def restrict(bot: Bot, chat_id: int, uid: int, td: timedelta | None):
     until = datetime.now(timezone.utc) + td if td else None
-    await bot.restrict_chat_member(
-        chat_id, uid, permissions=NO_RIGHTS, until_date=until
-    )
+    try:
+        await bot.restrict_chat_member(
+            chat_id, uid, permissions=NO_RIGHTS, until_date=until
+        )
+    except Exception as e:
+        if "METHOD_NOT_FOUND" in str(e):
+            FROZEN[wkey(chat_id, uid)] = until.timestamp() if until else 0
+            logging.warning("restrictChatMember не поддерживается, включён программный фриз")
+            return
+        raise
 
 
 # ---------- команды ----------
@@ -223,11 +236,13 @@ async def cmd_unfreeze(message: Message, command: CommandObject, bot: Bot):
     if not t:
         return
     uid, name, _ = t
+    FROZEN.pop(wkey(message.chat.id, uid), None)
     try:
         await bot.restrict_chat_member(message.chat.id, uid, permissions=FULL_RIGHTS)
     except Exception as e:
-        await message.reply(f"Не вышло: {e}")
-        return
+        if "METHOD_NOT_FOUND" not in str(e):
+            await message.reply(f"Не вышло: {e}")
+            return
     await message.reply(f"✅ С {mention(uid, name)} сняты ограничения", parse_mode="HTML")
 
 
@@ -375,6 +390,54 @@ async def cmd_warns(message: Message, command: CommandObject, bot: Bot):
         f"У {mention(uid, name)}: {count}/{WARN_LIMIT} предупреждений",
         parse_mode="HTML",
     )
+
+
+@router.message(Command("apicheck"))
+async def cmd_apicheck(message: Message, bot: Bot):
+    """Показывает, какие методы Bot API поддерживает приватка."""
+    if not await check_access(message, bot):
+        return
+    import aiohttp
+
+    base = API_BASE.rstrip("/") if API_BASE else "https://api.telegram.org"
+    methods = [
+        "getChatMember", "getChatAdministrators", "restrictChatMember",
+        "setChatPermissions", "banChatMember", "unbanChatMember",
+        "kickChatMember", "deleteMessage", "promoteChatMember",
+    ]
+    lines = []
+    async with aiohttp.ClientSession() as s:
+        for m in methods:
+            try:
+                async with s.post(
+                    f"{base}/bot{TOKEN}/{m}", json={},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    data = await r.json(content_type=None)
+                desc = str(data.get("description", "")).upper()
+                ok = r.status != 404 and "METHOD_NOT_FOUND" not in desc
+            except Exception:
+                ok = False
+            lines.append(("✅ " if ok else "❌ ") + m)
+    await message.reply("\n".join(lines))
+
+
+@router.message()
+async def watcher(message: Message, bot: Bot):
+    """Удаляет сообщения тех, кто заморожен программно."""
+    if not message.from_user:
+        return
+    k = wkey(message.chat.id, message.from_user.id)
+    if k not in FROZEN:
+        return
+    until = FROZEN[k]
+    if until and until < time.time():
+        FROZEN.pop(k, None)
+        return
+    try:
+        await message.delete()
+    except Exception as e:
+        logging.warning("не удалось удалить сообщение: %r", e)
 
 
 # ---------- веб-сервер для Render / UptimeRobot ----------
