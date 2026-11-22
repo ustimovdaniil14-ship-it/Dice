@@ -8,7 +8,9 @@ import time
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
-from aiogram import Bot, Dispatcher, F, Router
+from collections import OrderedDict
+
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
@@ -198,12 +200,39 @@ async def check_access(message: Message, bot: Bot) -> bool:
     return True
 
 
-def reply_user(rt):
+# Приватка в reply_to_message присылает только заглушку без автора,
+# поэтому бот сам запоминает, кто написал каждое сообщение.
+SEEN: OrderedDict = OrderedDict()
+SEEN_MAX = 30000
+
+
+class Recorder(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        try:
+            if event.from_user and event.chat:
+                SEEN[(event.chat.id, event.message_id)] = (
+                    event.from_user.id, event.from_user.full_name,
+                )
+                if len(SEEN) > SEEN_MAX:
+                    SEEN.popitem(last=False)
+        except Exception:
+            pass
+        return await handler(event, data)
+
+
+router.message.outer_middleware(Recorder())
+
+
+def reply_user(message):
     """Автор сообщения, на которое ответили: (id, имя) или None."""
+    rt = message.reply_to_message
     if not rt:
         return None
     if rt.from_user:
         return rt.from_user.id, rt.from_user.full_name
+    hit = SEEN.get((message.chat.id, rt.message_id))
+    if hit:
+        return hit
     extra = getattr(rt, "model_extra", None) or {}
     for k in ("from_id", "sender_id", "user_id"):
         v = extra.get(k)
@@ -228,7 +257,7 @@ async def cmd_debugreply(message: Message, bot: Bot):
 
 async def get_target(message: Message, command: CommandObject, bot: Bot):
     args = (command.args or "").split()
-    ru = reply_user(message.reply_to_message)
+    ru = reply_user(message)
     if ru:
         (uid, name), rest = ru, args
     elif args and args[0].lstrip("-").isdigit():
@@ -350,9 +379,9 @@ async def cmd_start(message: Message):
 
 @router.message(Command("id"))
 async def cmd_id(message: Message):
-    rt = message.reply_to_message
-    if rt and rt.from_user:
-        await message.reply(f"ID: <code>{rt.from_user.id}</code>")
+    ru = reply_user(message)
+    if ru:
+        await message.reply(f"ID: <code>{ru[0]}</code>")
     else:
         await message.reply(
             f"Твой ID: <code>{message.from_user.id}</code>\n"
@@ -442,9 +471,9 @@ async def cmd_unban(message: Message, command: CommandObject, bot: Bot):
     if not await check_access(message, bot):
         return
     args = (command.args or "").split()
-    rt = message.reply_to_message
-    if rt and rt.from_user:
-        uid = rt.from_user.id
+    ru = reply_user(message)
+    if ru:
+        uid = ru[0]
     elif args and args[0].lstrip("-").isdigit():
         uid = int(args[0])
     else:
@@ -513,10 +542,9 @@ async def cmd_unwarn(message: Message, command: CommandObject, bot: Bot):
 
 @router.message(Command("warns"))
 async def cmd_warns(message: Message):
-    rt = message.reply_to_message
-    u = rt.from_user if rt and rt.from_user else message.from_user
-    count = store.data["warns"].get(wkey(message.chat.id, u.id), 0)
-    await message.reply(f"У {mention(u.id, u.full_name)}: {count}/{WARN_LIMIT} предупреждений")
+    ru = reply_user(message) or (message.from_user.id, message.from_user.full_name)
+    count = store.data["warns"].get(wkey(message.chat.id, ru[0]), 0)
+    await message.reply(f"У {mention(ru[0], ru[1])}: {count}/{WARN_LIMIT} предупреждений")
 
 
 # ======================= ПАНЕЛЬ ВЛАДЕЛЬЦА (лс бота) =======================
@@ -700,11 +728,11 @@ async def _cmd_report(message: Message, bot: Bot):
         return
     reason = (REP_RE.match(message.text).group(3) or "").strip() or "не указана"
     rt = message.reply_to_message
-    ru = reply_user(rt)
+    ru = reply_user(message)
     if not ru:
         await message.reply(
-            "Не вижу автора сообщения. Ответь на сообщение нарушителя: "
-            "<code>.реп причина</code>\n(модератор может проверить: /debugreply ответом на него)"
+            "Не вижу автора этого сообщения (бот помнит только те, что написаны после его запуска). "
+            "Ответь на более свежее сообщение нарушителя: <code>.реп причина</code>"
         )
         return
     me = await bot.get_me()
