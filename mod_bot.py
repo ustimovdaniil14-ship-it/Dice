@@ -52,28 +52,46 @@ class Store:
         self.data = {"mods": {}, "global": [], "warns": {}, "expiry": {}}
         self.db_ok = True
 
-    async def load(self):
-        raw = None
+    async def _get(self, key):
         if DATABASE_URL:
-            try:
-                import asyncpg
+            import asyncpg
 
-                conn = await asyncpg.connect(DATABASE_URL.split("?")[0], ssl="require")
-                try:
-                    await conn.execute(
-                        "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)"
-                    )
-                    raw = await conn.fetchval("SELECT v FROM kv WHERE k='data'")
-                finally:
-                    await conn.close()
-            except Exception as e:
-                self.db_ok = False
-                logging.error("Не удалось загрузить из БД: %r", e)
-        elif os.path.exists(DATA_FILE):
+            conn = await asyncpg.connect(DATABASE_URL.split("?")[0], ssl="require")
             try:
-                raw = open(DATA_FILE, encoding="utf-8").read()
-            except Exception:
-                raw = None
+                await conn.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+                return await conn.fetchval("SELECT v FROM kv WHERE k=$1", key)
+            finally:
+                await conn.close()
+        path = f"{key}.json"
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        return None
+
+    async def _put(self, key, raw):
+        if DATABASE_URL:
+            import asyncpg
+
+            conn = await asyncpg.connect(DATABASE_URL.split("?")[0], ssl="require")
+            try:
+                await conn.execute(
+                    "INSERT INTO kv (k, v) VALUES ($1, $2) "
+                    "ON CONFLICT (k) DO UPDATE SET v = $2",
+                    key, raw,
+                )
+            finally:
+                await conn.close()
+        else:
+            with open(f"{key}.json", "w", encoding="utf-8") as f:
+                f.write(raw)
+
+    async def load(self):
+        try:
+            raw = await self._get("data")
+        except Exception as e:
+            self.db_ok = False
+            logging.error("Не удалось загрузить настройки: %r", e)
+            return
         if raw:
             try:
                 self.data.update(json.loads(raw))
@@ -81,30 +99,12 @@ class Store:
                 logging.error("Битые данные: %r", e)
 
     async def save(self):
-        raw = json.dumps(self.data, ensure_ascii=False)
-        if DATABASE_URL:
-            if not self.db_ok:
-                return
-            try:
-                import asyncpg
-
-                conn = await asyncpg.connect(DATABASE_URL.split("?")[0], ssl="require")
-                try:
-                    await conn.execute(
-                        "INSERT INTO kv (k, v) VALUES ('data', $1) "
-                        "ON CONFLICT (k) DO UPDATE SET v = $1",
-                        raw,
-                    )
-                finally:
-                    await conn.close()
-            except Exception as e:
-                logging.error("Не удалось сохранить в БД: %r", e)
-        else:
-            try:
-                with open(DATA_FILE, "w", encoding="utf-8") as f:
-                    f.write(raw)
-            except Exception as e:
-                logging.error("Не удалось сохранить файл: %r", e)
+        if not self.db_ok:
+            return
+        try:
+            await self._put("data", json.dumps(self.data, ensure_ascii=False))
+        except Exception as e:
+            logging.error("Не удалось сохранить настройки: %r", e)
 
 
 store = Store()
@@ -212,12 +212,18 @@ async def check_access(message: Message, bot: Bot) -> bool:
 
 
 # Приватка в reply_to_message присылает только заглушку без автора,
-# поэтому бот сам запоминает, кто написал каждое сообщение.
+# поэтому бот сам запоминает, кто написал каждое сообщение (и хранит это в БД).
 SEEN: OrderedDict = OrderedDict()
-SEEN_MAX = 30000
-
-
+SEEN_MAX = 8000
+SEEN_DIRTY = [False]
 RECEIVED = [0, 0]  # [всего сообщений боту, из них не команды]
+
+
+def remember(chat_id, msg_id, uid, name):
+    SEEN[(chat_id, msg_id)] = (uid, name)
+    if len(SEEN) > SEEN_MAX:
+        SEEN.popitem(last=False)
+    SEEN_DIRTY[0] = True
 
 
 class Recorder(BaseMiddleware):
@@ -227,11 +233,7 @@ class Recorder(BaseMiddleware):
             if not (event.text or "").startswith("/"):
                 RECEIVED[1] += 1
             if event.from_user and event.chat:
-                SEEN[(event.chat.id, event.message_id)] = (
-                    event.from_user.id, event.from_user.full_name,
-                )
-                if len(SEEN) > SEEN_MAX:
-                    SEEN.popitem(last=False)
+                remember(event.chat.id, event.message_id, event.from_user.id, event.from_user.full_name)
         except Exception:
             pass
         return await handler(event, data)
@@ -240,7 +242,62 @@ class Recorder(BaseMiddleware):
 router.message.outer_middleware(Recorder())
 
 
-def reply_user(message):
+async def load_seen():
+    try:
+        raw = await store._get("authors")
+        for c, m, u, n in json.loads(raw or "[]"):
+            SEEN[(c, m)] = (u, n)
+    except Exception as e:
+        logging.warning("не удалось загрузить авторов: %r", e)
+
+
+async def seen_flusher():
+    """Раз в 30 секунд сохраняет кэш авторов, чтобы он пережил перезапуск."""
+    while True:
+        await asyncio.sleep(30)
+        if not SEEN_DIRTY[0] or not store.db_ok:
+            continue
+        SEEN_DIRTY[0] = False
+        raw = json.dumps([[c, m, u, n] for (c, m), (u, n) in SEEN.items()], ensure_ascii=False)
+        try:
+            await store._put("authors", raw)
+        except Exception as e:
+            SEEN_DIRTY[0] = True
+            logging.warning("не удалось сохранить авторов: %r", e)
+
+
+def _fwd_user(fwd):
+    u = getattr(fwd, "forward_from", None)
+    if not u:
+        fo = getattr(fwd, "forward_origin", None)
+        u = getattr(fo, "sender_user", None) if fo else None
+    if u:
+        return u.id, u.full_name
+    d = (getattr(fwd, "model_extra", None) or {}).get("forward_from")
+    if isinstance(d, dict) and isinstance(d.get("id"), int):
+        name = " ".join(x for x in (d.get("first_name"), d.get("last_name")) if x) or str(d["id"])
+        return d["id"], name
+    return None
+
+
+async def author_via_forward(bot: Bot, chat_id: int, msg_id: int):
+    """Для старых сообщений: пересылаем владельцу, читаем автора, удаляем пересылку."""
+    for dest in OWNER_IDS:
+        try:
+            fwd = await bot.forward_message(chat_id=dest, from_chat_id=chat_id, message_id=msg_id)
+        except Exception as e:
+            logging.warning("поиск автора через пересылку не удался: %r", e)
+            continue
+        found = _fwd_user(fwd)
+        try:
+            await bot.delete_message(dest, fwd.message_id)
+        except Exception:
+            pass
+        return found
+    return None
+
+
+async def reply_user(message, bot=None):
     """Автор сообщения, на которое ответили: (id, имя) или None."""
     rt = message.reply_to_message
     if not rt:
@@ -255,10 +312,15 @@ def reply_user(message):
         v = extra.get(k)
         if isinstance(v, int):
             return v, str(v)
+    if bot is not None:
+        found = await author_via_forward(bot, message.chat.id, rt.message_id)
+        if found:
+            remember(message.chat.id, rt.message_id, *found)
+            return found
     return None
 
 
-@router.message(Command("privacy"))
+@router.message(Command("privacy", "status"))
 async def cmd_privacy(message: Message, bot: Bot):
     """Диагностика: видит ли бот обычные сообщения в чате или только команды."""
     if not await check_access(message, bot):
@@ -268,7 +330,8 @@ async def cmd_privacy(message: Message, bot: Bot):
         f"can_read_all_group_messages: {me.can_read_all_group_messages}\n"
         f"всего получено сообщений: {RECEIVED[0]}\n"
         f"из них НЕ команд: {RECEIVED[1]}\n"
-        f"запомнено авторов: {len(SEEN)}\n\n"
+        f"запомнено авторов: {len(SEEN)}\n"
+        f"хранилище: {'Neon БД (всё сохраняется)' if DATABASE_URL else 'ФАЙЛ - пропадёт при деплое! Добавь DATABASE_URL'}\n\n"
         "Если «НЕ команд» не растёт, когда в чате пишут обычные сообщения, "
         "бот их не получает (включён режим приватности)."
     )
@@ -290,7 +353,7 @@ async def cmd_debugreply(message: Message, bot: Bot):
 
 async def get_target(message: Message, command: CommandObject, bot: Bot):
     args = (command.args or "").split()
-    ru = reply_user(message)
+    ru = await reply_user(message, bot)
     if ru:
         (uid, name), rest = ru, args
     elif args and args[0].lstrip("-").isdigit():
@@ -411,8 +474,8 @@ async def cmd_start(message: Message):
 
 
 @router.message(Command("id"))
-async def cmd_id(message: Message):
-    ru = reply_user(message)
+async def cmd_id(message: Message, bot: Bot):
+    ru = await reply_user(message, bot)
     if ru:
         await message.reply(f"ID: <code>{ru[0]}</code>")
     else:
@@ -504,7 +567,7 @@ async def cmd_unban(message: Message, command: CommandObject, bot: Bot):
     if not await check_access(message, bot):
         return
     args = (command.args or "").split()
-    ru = reply_user(message)
+    ru = await reply_user(message, bot)
     if ru:
         uid = ru[0]
     elif args and args[0].lstrip("-").isdigit():
@@ -574,10 +637,52 @@ async def cmd_unwarn(message: Message, command: CommandObject, bot: Bot):
 
 
 @router.message(Command("warns"))
-async def cmd_warns(message: Message):
-    ru = reply_user(message) or (message.from_user.id, message.from_user.full_name)
+async def cmd_warns(message: Message, bot: Bot):
+    ru = await reply_user(message, bot) or (message.from_user.id, message.from_user.full_name)
     count = store.data["warns"].get(wkey(message.chat.id, ru[0]), 0)
     await message.reply(f"У {mention(ru[0], ru[1])}: {count}/{WARN_LIMIT} предупреждений")
+
+
+@router.message(Command("addmod", "delmod", "mods"))
+async def cmd_mods(message: Message, command: CommandObject, bot: Bot):
+    """Владелец прямо в чате назначает модераторов (ID чата вводить не надо)."""
+    if message.chat.type == "private":
+        await message.reply("Команда работает в самом чате.")
+        return
+    if message.from_user.id not in OWNER_IDS:
+        await message.reply("Только для владельца.")
+        return
+    cmd = (message.text or "").split()[0].lstrip("/").split("@")[0].lower()
+    lst = store.data["mods"].setdefault(str(message.chat.id), [])
+    if cmd == "mods":
+        glob = sorted(set(store.data["global"]) | ADMIN_IDS)
+        await message.reply(
+            "<b>Модераторы этого чата</b>\n"
+            + (", ".join(f"<code>{i}</code>" for i in lst) or "-")
+            + "\n<b>Во всех чатах</b>\n"
+            + (", ".join(f"<code>{i}</code>" for i in glob) or "-")
+            + "\nАдмины чата тоже могут пользоваться ботом."
+        )
+        return
+    ru = await reply_user(message, bot)
+    args = (command.args or "").split()
+    if ru:
+        uid = ru[0]
+    elif args and args[0].lstrip("-").isdigit():
+        uid = int(args[0])
+    else:
+        await message.reply("Ответь на сообщение человека или укажи ID: /addmod 123456")
+        return
+    if cmd == "addmod":
+        if uid not in lst:
+            lst.append(uid)
+        text = f"✅ <code>{uid}</code> теперь модератор этого чата"
+    else:
+        if uid in lst:
+            lst.remove(uid)
+        text = f"✅ <code>{uid}</code> больше не модератор этого чата"
+    await store.save()
+    await message.reply(text)
 
 
 # ======================= ПАНЕЛЬ ВЛАДЕЛЬЦА (лс бота) =======================
@@ -763,7 +868,7 @@ async def _cmd_report(message: Message, bot: Bot):
         return
     reason = (REP_RE.match(message.text).group(3) or "").strip() or "не указана"
     rt = message.reply_to_message
-    ru = reply_user(message)
+    ru = await reply_user(message, bot)
     if not ru:
         await message.reply(
             "Не вижу автора этого сообщения (бот помнит только те, что написаны после его запуска). "
@@ -971,6 +1076,8 @@ async def main():
     await start_web()
     asyncio.create_task(keep_alive())
     await store.load()
+    await load_seen()
+    asyncio.create_task(seen_flusher())
     props = DefaultBotProperties(parse_mode="HTML")
     if API_BASE:
         session = AiohttpSession(api=TelegramAPIServer.from_base(API_BASE))
