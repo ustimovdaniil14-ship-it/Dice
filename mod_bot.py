@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -197,11 +198,39 @@ async def check_access(message: Message, bot: Bot) -> bool:
     return True
 
 
+def reply_user(rt):
+    """Автор сообщения, на которое ответили: (id, имя) или None."""
+    if not rt:
+        return None
+    if rt.from_user:
+        return rt.from_user.id, rt.from_user.full_name
+    extra = getattr(rt, "model_extra", None) or {}
+    for k in ("from_id", "sender_id", "user_id"):
+        v = extra.get(k)
+        if isinstance(v, int):
+            return v, str(v)
+    return None
+
+
+@router.message(Command("debugreply"))
+async def cmd_debugreply(message: Message, bot: Bot):
+    """Показывает, что именно приватка присылает боту в reply_to_message."""
+    if not await check_access(message, bot):
+        return
+    rt = message.reply_to_message
+    if not rt:
+        await message.reply("Ответь этой командой на любое сообщение.")
+        return
+    raw = rt.model_dump_json(exclude_none=True)
+    logging.info("debugreply: %s", raw)
+    await message.reply(f"<pre>{esc(raw[:1500])}</pre>")
+
+
 async def get_target(message: Message, command: CommandObject, bot: Bot):
     args = (command.args or "").split()
-    rt = message.reply_to_message
-    if rt and rt.from_user:
-        uid, name, rest = rt.from_user.id, rt.from_user.full_name, args
+    ru = reply_user(message.reply_to_message)
+    if ru:
+        (uid, name), rest = ru, args
     elif args and args[0].lstrip("-").isdigit():
         uid, name, rest = int(args[0]), args[0], args[1:]
     else:
@@ -656,15 +685,30 @@ def duration_kb(rid: str, act: str):
 
 @router.message(lambda m: bool(m.text) and REP_RE.match(m.text) is not None)
 async def cmd_report(message: Message, bot: Bot):
+    try:
+        await _cmd_report(message, bot)
+    except Exception as e:
+        logging.exception("жалоба не удалась")
+        try:
+            await message.reply(f"Ошибка жалобы: {esc(str(e))[:300]}")
+        except Exception:
+            pass
+
+
+async def _cmd_report(message: Message, bot: Bot):
     if message.chat.type == "private":
         return
     reason = (REP_RE.match(message.text).group(3) or "").strip() or "не указана"
     rt = message.reply_to_message
-    if not rt or not rt.from_user:
-        await message.reply("Ответь на сообщение нарушителя: <code>.реп причина</code>")
+    ru = reply_user(rt)
+    if not ru:
+        await message.reply(
+            "Не вижу автора сообщения. Ответь на сообщение нарушителя: "
+            "<code>.реп причина</code>\n(модератор может проверить: /debugreply ответом на него)"
+        )
         return
     me = await bot.get_me()
-    target, reporter = rt.from_user, message.from_user
+    target, reporter = SimpleNamespace(id=ru[0], full_name=ru[1]), message.from_user
     if target.id in (me.id, reporter.id):
         return
     if await protected(bot, message.chat.id, target.id):
