@@ -115,14 +115,25 @@ UNITS = {"s": 1, "с": 1, "m": 60, "м": 60, "h": 3600, "ч": 3600,
          "d": 86400, "д": 86400, "w": 604800, "н": 604800}
 
 
+_TOKEN = re.compile(r"(\d+)\s*([a-zа-я]+)")
+
+
 def parse_duration(text: str):
-    m = re.fullmatch(r"(\d+)\s*([a-zа-я])", text.strip().lower())
-    if not m:
+    """45m, 3h, 2d, 1d12h, 1ч30м, 2нед, 1мес -> timedelta или None."""
+    t = text.strip().lower()
+    parts = _TOKEN.findall(t)
+    if not parts or _TOKEN.sub("", t).strip():
         return None
-    n, unit = int(m.group(1)), m.group(2)
-    if unit not in UNITS or n <= 0:
-        return None
-    return timedelta(seconds=n * UNITS[unit])
+    total = 0
+    for n, u in parts:
+        if u.startswith(("мес", "mo")):
+            sec = 30 * 86400
+        elif u[0] in UNITS:
+            sec = UNITS[u[0]]
+        else:
+            return None
+        total += int(n) * sec
+    return timedelta(seconds=total) if total > 0 else None
 
 
 def human(td) -> str:
@@ -206,9 +217,15 @@ SEEN: OrderedDict = OrderedDict()
 SEEN_MAX = 30000
 
 
+RECEIVED = [0, 0]  # [всего сообщений боту, из них не команды]
+
+
 class Recorder(BaseMiddleware):
     async def __call__(self, handler, event, data):
         try:
+            RECEIVED[0] += 1
+            if not (event.text or "").startswith("/"):
+                RECEIVED[1] += 1
             if event.from_user and event.chat:
                 SEEN[(event.chat.id, event.message_id)] = (
                     event.from_user.id, event.from_user.full_name,
@@ -239,6 +256,22 @@ def reply_user(message):
         if isinstance(v, int):
             return v, str(v)
     return None
+
+
+@router.message(Command("privacy"))
+async def cmd_privacy(message: Message, bot: Bot):
+    """Диагностика: видит ли бот обычные сообщения в чате или только команды."""
+    if not await check_access(message, bot):
+        return
+    me = await bot.get_me()
+    await message.reply(
+        f"can_read_all_group_messages: {me.can_read_all_group_messages}\n"
+        f"всего получено сообщений: {RECEIVED[0]}\n"
+        f"из них НЕ команд: {RECEIVED[1]}\n"
+        f"запомнено авторов: {len(SEEN)}\n\n"
+        "Если «НЕ команд» не растёт, когда в чате пишут обычные сообщения, "
+        "бот их не получает (включён режим приватности)."
+    )
 
 
 @router.message(Command("debugreply"))
@@ -354,7 +387,7 @@ async def do_warn(bot, chat_id, uid):
 # ======================= КОМАНДЫ В ЧАТЕ =======================
 HELP = (
     "<b>Команды модератора</b> (ответом на сообщение или по ID):\n"
-    "/freeze 30m [причина] - фриз на время (s/m/h/d/w или с/м/ч/д/н)\n"
+    "/freeze 30m [причина] - фриз на время: 45m, 3h, 2d, 1d12h (s/m/h/d/w или с/м/ч/д/н)\n"
     "/unfreeze - снять фриз\n"
     "/mute [время] [причина] - мут (без времени = навсегда)\n"
     "/unmute - снять мут\n"
@@ -589,6 +622,7 @@ def render_list() -> str:
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
+    PENDING.pop((message.chat.id, message.from_user.id), None)
     await message.answer("Отменено.")
 
 
@@ -706,6 +740,7 @@ def duration_kb(rid: str, act: str):
     b = InlineKeyboardBuilder()
     for label, val in DURATIONS[act]:
         b.button(text=label, callback_data=f"r:{rid}:{act}:{val}")
+    b.button(text="✏️ Своё время", callback_data=f"r:{rid}:{act}:c")
     b.button(text="◀️ Назад", callback_data=f"r:{rid}:menu")
     b.adjust(3, 3, 1)
     return b.as_markup()
@@ -772,6 +807,33 @@ async def _cmd_report(message: Message, bot: Bot):
         pass
 
 
+PENDING: dict = {}      # (chat_id, mod_id) -> ожидание своего срока
+PENDING_TTL = 120
+
+
+async def close_report(bot: Bot, rep: dict, rid: str, rmsg: int, result: str, who: str):
+    REPORTS.pop(rid, None)
+    try:
+        await bot.edit_message_text(
+            f"{rep['text']}\n\n✅ {result}\nРешил: {who}",
+            chat_id=rep["chat"], message_id=rmsg, reply_markup=None,
+        )
+    except Exception as e:
+        logging.warning("не удалось обновить жалобу: %r", e)
+
+
+async def run_timed(bot: Bot, rep: dict, act: str, td):
+    chat_id, uid = rep["chat"], rep["target"]
+    name = mention(uid, rep["tname"])
+    if act == "ban":
+        await do_ban(bot, chat_id, uid, td)
+        return f"{name} забанен: {human(td)}"
+    await do_restrict(bot, chat_id, uid, td)
+    if act == "freeze":
+        return f"{name} заморожен на {human(td)}"
+    return f"{name} в муте: {human(td)}"
+
+
 @router.callback_query(F.data.startswith("r:"))
 async def on_report(cb: CallbackQuery, bot: Bot):
     parts = cb.data.split(":")
@@ -785,13 +847,10 @@ async def on_report(cb: CallbackQuery, bot: Bot):
         await cb.answer("Только для модераторов", show_alert=True)
         return
     who = mention(cb.from_user.id, cb.from_user.full_name)
+    rmsg = cb.message.message_id
 
     async def finish(result: str):
-        REPORTS.pop(rid, None)
-        try:
-            await cb.message.edit_text(f"{rep['text']}\n\n✅ {result}\nРешил: {who}", reply_markup=None)
-        except Exception:
-            pass
+        await close_report(bot, rep, rid, rmsg, result, who)
         await cb.answer("Готово")
 
     try:
@@ -801,18 +860,21 @@ async def on_report(cb: CallbackQuery, bot: Bot):
         elif act in DURATIONS and len(parts) == 3:
             await cb.message.edit_reply_markup(reply_markup=duration_kb(rid, act))
             await cb.answer("Выбери срок")
+        elif act in DURATIONS and parts[3] == "c":
+            hint = "" if act == "freeze" else ", <code>0</code> - навсегда"
+            prompt = await cb.message.answer(
+                f"✏️ {who}, ответным сообщением напиши срок: "
+                f"<code>45m</code>, <code>3h</code>, <code>2d</code>, <code>1d12h</code>{hint}.\n"
+                f"Жду {PENDING_TTL // 60} мин. Отмена: /cancel"
+            )
+            PENDING[(chat_id, cb.from_user.id)] = {
+                "rid": rid, "act": act, "rmsg": rmsg,
+                "until": time.time() + PENDING_TTL, "prompt": prompt.message_id,
+            }
+            await cb.answer("Напиши срок в чат")
         elif act in DURATIONS:
             td = None if parts[3] == "0" else parse_duration(parts[3])
-            name = mention(uid, tname)
-            if act == "ban":
-                await do_ban(bot, chat_id, uid, td)
-                await finish(f"{name} забанен: {human(td)}")
-            elif act == "freeze":
-                await do_restrict(bot, chat_id, uid, td)
-                await finish(f"{name} заморожен на {human(td)}")
-            else:
-                await do_restrict(bot, chat_id, uid, td)
-                await finish(f"{name} в муте: {human(td)}")
+            await finish(await run_timed(bot, rep, act, td))
         elif act == "warn":
             count, froze = await do_warn(bot, chat_id, uid)
             extra = f", авто-фриз на {human(parse_duration(WARN_FREEZE))}" if froze else ""
@@ -829,6 +891,51 @@ async def on_report(cb: CallbackQuery, bot: Bot):
             await cb.answer()
     except Exception as e:
         await cb.answer(f"Ошибка: {str(e)[:150]}", show_alert=True)
+
+
+def _pending_filter(m: Message) -> bool:
+    return (
+        bool(m.text)
+        and m.from_user is not None
+        and (m.chat.id, m.from_user.id) in PENDING
+        and not m.text.startswith("/")
+        and REP_RE.match(m.text) is None
+    )
+
+
+@router.message(_pending_filter)
+async def on_custom_time(message: Message, bot: Bot):
+    """Модератор нажал «Своё время» и пишет срок обычным сообщением."""
+    key = (message.chat.id, message.from_user.id)
+    p = PENDING.get(key)
+    if not p or p["until"] < time.time():
+        PENDING.pop(key, None)
+        return
+    t = message.text.strip().lower()
+    forever = t in ("0", "навсегда", "forever", "inf")
+    td = None if forever else parse_duration(t)
+    if not forever and td is None:
+        rt = message.reply_to_message
+        if rt and rt.message_id == p["prompt"]:
+            await message.reply("Не понял срок. Примеры: 45m, 3h, 2d, 1d12h, 1ч30м.")
+        return
+    act = p["act"]
+    if act == "freeze" and forever:
+        await message.reply("Для фриза нужен конкретный срок.")
+        return
+    rep = REPORTS.get(p["rid"])
+    PENDING.pop(key, None)
+    if not rep:
+        await message.reply("Эта жалоба уже закрыта.")
+        return
+    who = mention(message.from_user.id, message.from_user.full_name)
+    try:
+        result = await run_timed(bot, rep, act, td)
+    except Exception as e:
+        await message.reply(f"Не вышло: {esc(str(e))}")
+        return
+    await close_report(bot, rep, p["rid"], p["rmsg"], result, who)
+    await message.reply(f"✅ {result}")
 
 
 # ======================= ВЕБ-СЕРВЕР / ЗАПУСК =======================
