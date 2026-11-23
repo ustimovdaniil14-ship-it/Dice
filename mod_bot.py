@@ -107,18 +107,62 @@ async def check_access(message: Message, bot: Bot) -> bool:
     return True
 
 
+# Кэш авторов сообщений: приватка может не передавать from_user в reply_to_message
+from collections import OrderedDict
+
+MSG_AUTHORS: "OrderedDict[str, tuple]" = OrderedDict()
+
+
+def remember_author(message: Message):
+    if message.from_user:
+        MSG_AUTHORS[f"{message.chat.id}:{message.message_id}"] = (
+            message.from_user.id, message.from_user.full_name,
+        )
+        while len(MSG_AUTHORS) > 20000:
+            MSG_AUTHORS.popitem(last=False)
+
+
+def reply_author(message: Message):
+    """(user_id, name) автора сообщения, на которое ответили, или None."""
+    r = message.reply_to_message
+    rid = None
+    if r is not None:
+        if r.from_user:
+            return r.from_user.id, r.from_user.full_name
+        rid = r.message_id
+    else:
+        try:
+            rid = message.model_dump(exclude_none=True).get("reply_to_message_id")
+        except Exception:
+            rid = None
+    if rid:
+        return MSG_AUTHORS.get(f"{message.chat.id}:{rid}")
+    return None
+
+
+def reply_debug(message: Message) -> str:
+    try:
+        return str(message.model_dump(exclude_none=True))[:700]
+    except Exception as e:
+        return repr(e)
+
+
 async def get_target(message: Message, command: CommandObject, bot: Bot):
     """Возвращает (user_id, name, остаток_аргументов) или None."""
     args = (command.args or "").split()
-    if message.reply_to_message and message.reply_to_message.from_user:
-        u = message.reply_to_message.from_user
-        uid, name, rest = u.id, u.full_name, args
+    ra = reply_author(message)
+    if ra:
+        uid, name = ra
+        rest = args
     elif args and args[0].lstrip("-").isdigit():
         uid = int(args[0])
         name = str(uid)
         rest = args[1:]
     else:
-        await message.reply("Ответь на сообщение человека или укажи его ID.")
+        text = "Ответь на сообщение человека или укажи его ID."
+        if message.reply_to_message is not None:
+            text += "\n\nНе вижу автора сообщения (приватка не передала). Для отладки:\n" + reply_debug(message)
+        await message.reply(text)
         return None
 
     me = await bot.me()
@@ -212,6 +256,7 @@ class FreezeMiddleware(BaseMiddleware):
 
     async def __call__(self, handler, event: Message, data):
         STATS["seen"] += 1
+        remember_author(event)
         u = event.from_user
         logging.info("msg chat=%s from=%s text=%r", event.chat.id, u.id if u else None, (event.text or "")[:40])
         if u:
@@ -269,8 +314,9 @@ async def cmd_help(message: Message):
 
 @router.message(Command("id"))
 async def cmd_id(message: Message):
-    if message.reply_to_message and message.reply_to_message.from_user:
-        await message.reply(f"ID: <code>{message.reply_to_message.from_user.id}</code>", parse_mode="HTML")
+    ra = reply_author(message)
+    if ra:
+        await message.reply(f"ID: <code>{ra[0]}</code>", parse_mode="HTML")
     else:
         await message.reply(f"Твой ID: <code>{message.from_user.id}</code>\nID чата: <code>{message.chat.id}</code>", parse_mode="HTML")
 
@@ -378,8 +424,9 @@ async def cmd_unban(message: Message, command: CommandObject, bot: Bot):
     if not await check_access(message, bot):
         return
     args = (command.args or "").split()
-    if message.reply_to_message and message.reply_to_message.from_user:
-        uid = message.reply_to_message.from_user.id
+    ra = reply_author(message)
+    if ra:
+        uid = ra[0]
     elif args and args[0].lstrip("-").isdigit():
         uid = int(args[0])
     else:
@@ -463,9 +510,9 @@ async def cmd_unwarn(message: Message, command: CommandObject, bot: Bot):
 
 @router.message(Command("warns"))
 async def cmd_warns(message: Message, command: CommandObject, bot: Bot):
-    if message.reply_to_message and message.reply_to_message.from_user:
-        u = message.reply_to_message.from_user
-        uid, name = u.id, u.full_name
+    ra = reply_author(message)
+    if ra:
+        uid, name = ra
     else:
         uid, name = message.from_user.id, message.from_user.full_name
     count = WARNS.get(wkey(message.chat.id, uid), 0)
