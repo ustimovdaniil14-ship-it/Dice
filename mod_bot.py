@@ -10,9 +10,10 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ChatMemberStatus
-from aiogram.exceptions import TelegramNotFound
+from aiogram.exceptions import ClientDecodeError, TelegramNotFound
+from aiogram.methods import GetUpdates
 from aiogram.filters import Command, CommandObject
-from aiogram.types import ChatPermissions, Message, User
+from aiogram.types import ChatPermissions, Message, Update, User
 
 logging.basicConfig(level=logging.INFO)
 
@@ -41,6 +42,30 @@ def save_warns():
 
 def wkey(chat_id, user_id):
     return f"{chat_id}:{user_id}"
+
+
+RULES_FILE = "rules.json"
+try:
+    with open(RULES_FILE, "r", encoding="utf-8") as f:
+        RULES: dict = json.load(f)
+except Exception:
+    RULES = {}
+
+# Имена людей, которым выдавали варны (для /warnsall)
+NAMES_FILE = "warn_names.json"
+try:
+    with open(NAMES_FILE, "r", encoding="utf-8") as f:
+        WARN_NAMES: dict = json.load(f)
+except Exception:
+    WARN_NAMES = {}
+
+
+def save_names():
+    try:
+        with open(NAMES_FILE, "w", encoding="utf-8") as f:
+            json.dump(WARN_NAMES, f, ensure_ascii=False)
+    except Exception as e:
+        logging.warning("не удалось сохранить warn_names.json: %r", e)
 
 
 # ---------- утилиты ----------
@@ -85,8 +110,55 @@ ADMIN_IDS = {
 }
 
 
+# Кому слать ошибки и отладку в личку (он должен один раз написать боту /start в ЛС)
+OWNER_ID = int(os.getenv("OWNER_ID", "1780243219"))
+# Показывать подробности ошибок в самом чате (1) или только в ЛС владельцу (0)
+REPORTS_IN_CHAT = os.getenv("REPORTS_IN_CHAT", "1") == "1"
+
+
+async def report(bot: Bot, text: str):
+    """Отправляет техническую информацию владельцу в ЛС, а не в чат."""
+    logging.warning("REPORT: %s", text)
+    if not OWNER_ID:
+        return
+    try:
+        await bot.send_message(OWNER_ID, text[:4000])
+    except Exception as e:
+        logging.warning("не удалось отправить отчёт в ЛС: %r", e)
+
+
+async def fail(message: Message, bot: Bot, e: Exception):
+    if REPORTS_IN_CHAT:
+        await message.reply(f"Не вышло: {e}")
+    else:
+        await message.reply("Не вышло, подробности отправил админу в ЛС.")
+    await report(bot, f"Ошибка в чате {message.chat.id}, команда {message.text!r}:\n{e!r}")
+
+
+# Админы бота по чатам: {"<chat_id>": [user_id, ...]}. Меняются командами /addadmin, /deladmin.
+ADMINS_FILE = "admins.json"
+try:
+    with open(ADMINS_FILE, "r", encoding="utf-8") as f:
+        CHAT_ADMINS: dict = json.load(f)
+except Exception:
+    CHAT_ADMINS = {}
+
+
+def save_admins():
+    try:
+        with open(ADMINS_FILE, "w", encoding="utf-8") as f:
+            json.dump(CHAT_ADMINS, f)
+    except Exception as e:
+        logging.warning("не удалось сохранить admins.json: %r", e)
+
+
+def is_super(user_id: int) -> bool:
+    """Главные админы (ADMIN_IDS / OWNER_ID): могут назначать админов в любом чате."""
+    return user_id in ADMIN_IDS or user_id == OWNER_ID
+
+
 async def is_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
-    if user_id in ADMIN_IDS:
+    if user_id in ADMIN_IDS or user_id in CHAT_ADMINS.get(str(chat_id), []):
         return True
     try:
         m = await bot.get_chat_member(chat_id, user_id)
@@ -108,12 +180,17 @@ async def check_access(message: Message, bot: Bot) -> bool:
 
 
 # Кэш авторов сообщений: приватка может не передавать from_user в reply_to_message
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 MSG_AUTHORS: "OrderedDict[str, tuple]" = OrderedDict()
 
 
+CHAT_MSGS: dict = {}  # chat_id -> последние message_id (для /purge)
+LOCKED: set = set()   # чаты в режиме /lock
+
+
 def remember_author(message: Message):
+    CHAT_MSGS.setdefault(message.chat.id, deque(maxlen=500)).append(message.message_id)
     if message.from_user:
         MSG_AUTHORS[f"{message.chat.id}:{message.message_id}"] = (
             message.from_user.id, message.from_user.full_name,
@@ -161,7 +238,11 @@ async def get_target(message: Message, command: CommandObject, bot: Bot):
     else:
         text = "Ответь на сообщение человека или укажи его ID."
         if message.reply_to_message is not None:
-            text += "\n\nНе вижу автора сообщения (приватка не передала). Для отладки:\n" + reply_debug(message)
+            text = ("Не вижу автора этого сообщения (бот его не запомнил). "
+                    "Ответь на более свежее сообщение человека или укажи его ID.")
+            if REPORTS_IN_CHAT:
+                text += "\n\nОтладка:\n" + reply_debug(message)
+            await report(bot, "Нет автора в reply:\n" + reply_debug(message))
         await message.reply(text)
         return None
 
@@ -275,6 +356,14 @@ class FreezeMiddleware(BaseMiddleware):
                         STATS["last_error"] = repr(e)
                         logging.warning("не удалось удалить сообщение: %r", e)
                     return
+        if event.chat.id in LOCKED and u:
+            bot = data.get("bot")
+            if bot is not None and not await is_admin(bot, event.chat.id, u.id):
+                try:
+                    await event.delete()
+                except Exception as e:
+                    logging.warning("lock: не удалось удалить: %r", e)
+                return
         return await handler(event, data)
 
 
@@ -307,7 +396,21 @@ async def cmd_help(message: Message):
         "/warn [причина] - предупреждение\n"
         "/unwarn - снять одно предупреждение\n"
         "/warns - сколько предупреждений\n"
-        "/id - узнать ID",
+        "/warnsall - у кого сколько предупреждений в чате\n"
+        "/frozenlist - кто сейчас заморожен\n"
+        "/clearwarns - сбросить варны человеку\n"
+        "/warnsreset - сбросить варны у всех (главные админы)\n"
+        "/info - сводка по человеку\n"
+        "/del - удалить сообщение (ответом)\n"
+        "/purge N - удалить последние N сообщений\n"
+        "/lock, /unlock - закрыть/открыть чат для не-админов\n"
+        "/say текст - написать от имени бота\n"
+        "/rules, /setrules - правила чата\n"
+        "/report - пожаловаться на сообщение (для всех)\n"
+        "/id - узнать ID\n"
+        "/addadmin - назначить админа бота в этом чате (только главные админы)\n"
+        "/deladmin - снять админа бота\n"
+        "/admins - список админов",
         parse_mode="HTML",
     )
 
@@ -337,7 +440,7 @@ async def cmd_freeze(message: Message, command: CommandObject, bot: Bot):
     try:
         mode = await restrict(bot, message.chat.id, uid, td)
     except Exception as e:
-        await message.reply(f"Не вышло: {e}")
+        await fail(message, bot, e)
         return
     await message.reply(
         f"🧊 {mention(uid, name)} заморожен на <b>{human(td)}</b>\nПричина: {reason}"
@@ -360,7 +463,7 @@ async def cmd_unfreeze(message: Message, command: CommandObject, bot: Bot):
         await bot.restrict_chat_member(message.chat.id, uid, permissions=FULL_RIGHTS)
     except Exception as e:
         if not not_supported(e):
-            await message.reply(f"Не вышло: {e}")
+            await fail(message, bot, e)
             return
     await message.reply(f"✅ С {mention(uid, name)} сняты ограничения", parse_mode="HTML")
 
@@ -379,7 +482,7 @@ async def cmd_mute(message: Message, command: CommandObject, bot: Bot):
     try:
         mode = await restrict(bot, message.chat.id, uid, td)
     except Exception as e:
-        await message.reply(f"Не вышло: {e}")
+        await fail(message, bot, e)
         return
     срок = human(td) if td else "навсегда"
     await message.reply(
@@ -409,7 +512,7 @@ async def cmd_ban(message: Message, command: CommandObject, bot: Bot):
             soft_freeze(message.chat.id, uid, until)
             soft = True
         else:
-            await message.reply(f"Не вышло: {e}")
+            await fail(message, bot, e)
             return
     срок = human(td) if td else "навсегда"
     await message.reply(
@@ -435,7 +538,7 @@ async def cmd_unban(message: Message, command: CommandObject, bot: Bot):
     try:
         await bot.unban_chat_member(message.chat.id, uid, only_if_banned=True)
     except Exception as e:
-        await message.reply(f"Не вышло: {e}")
+        await fail(message, bot, e)
         return
     await message.reply(f"✅ <code>{uid}</code> разбанен", parse_mode="HTML")
 
@@ -456,7 +559,7 @@ async def cmd_kick(message: Message, command: CommandObject, bot: Bot):
         if not_supported(e):
             await message.reply("В этой приватке нет banChatMember, кик невозможен.")
         else:
-            await message.reply(f"Не вышло: {e}")
+            await fail(message, bot, e)
         return
     await message.reply(
         f"👢 {mention(uid, name)} выгнан\nПричина: {reason}", parse_mode="HTML"
@@ -473,6 +576,9 @@ async def cmd_warn(message: Message, command: CommandObject, bot: Bot):
     uid, name, rest = t
     reason = " ".join(rest) or "не указана"
     k = wkey(message.chat.id, uid)
+    if name and name != str(uid):
+        WARN_NAMES[k] = name
+        save_names()
     WARNS[k] = WARNS.get(k, 0) + 1
     count = WARNS[k]
     text = (
@@ -486,7 +592,9 @@ async def cmd_warn(message: Message, command: CommandObject, bot: Bot):
             await restrict(bot, message.chat.id, uid, td)
             text += f"\n\n🧊 Лимит варнов - фриз на {human(td)}"
         except Exception as e:
-            text += f"\n\nНе удалось заморозить: {e}"
+            text += (f"\n\nНе удалось заморозить: {e}" if REPORTS_IN_CHAT
+                     else "\n\nНе удалось заморозить (подробности отправил админу)")
+            await report(bot, f"Автофриз после варнов не удался:\n{e!r}")
     save_warns()
     await message.reply(text, parse_mode="HTML")
 
@@ -520,6 +628,299 @@ async def cmd_warns(message: Message, command: CommandObject, bot: Bot):
         f"У {mention(uid, name)}: {count}/{WARN_LIMIT} предупреждений",
         parse_mode="HTML",
     )
+
+
+@router.message(Command("addadmin"))
+async def cmd_addadmin(message: Message, command: CommandObject, bot: Bot):
+    """Назначить админа бота в ЭТОМ чате (ответом на сообщение или по ID). Только для главных админов."""
+    if message.chat.type == "private":
+        await message.reply("Эта команда работает только в чате.")
+        return
+    if not message.from_user or not is_super(message.from_user.id):
+        await message.reply("Назначать админов могут только главные админы бота.")
+        return
+    args = (command.args or "").split()
+    ra = reply_author(message)
+    if ra:
+        uid, name = ra
+    elif args and args[0].lstrip("-").isdigit():
+        uid, name = int(args[0]), args[0]
+    else:
+        await message.reply("Ответь на сообщение человека или укажи ID: /addadmin 123456789")
+        return
+    k = str(message.chat.id)
+    lst = CHAT_ADMINS.setdefault(k, [])
+    if uid in lst or uid in ADMIN_IDS:
+        await message.reply("Он уже админ бота.")
+        return
+    lst.append(uid)
+    save_admins()
+    await message.reply(f"✅ {mention(uid, name)} теперь админ бота в этом чате", parse_mode="HTML")
+
+
+@router.message(Command("deladmin"))
+async def cmd_deladmin(message: Message, command: CommandObject, bot: Bot):
+    if message.chat.type == "private":
+        await message.reply("Эта команда работает только в чате.")
+        return
+    if not message.from_user or not is_super(message.from_user.id):
+        await message.reply("Снимать админов могут только главные админы бота.")
+        return
+    args = (command.args or "").split()
+    ra = reply_author(message)
+    if ra:
+        uid, name = ra
+    elif args and args[0].lstrip("-").isdigit():
+        uid, name = int(args[0]), args[0]
+    else:
+        await message.reply("Ответь на сообщение человека или укажи ID: /deladmin 123456789")
+        return
+    lst = CHAT_ADMINS.get(str(message.chat.id), [])
+    if uid not in lst:
+        await message.reply("Его нет в списке админов этого чата (главных админов отсюда не снять).")
+        return
+    lst.remove(uid)
+    save_admins()
+    await message.reply(f"✅ {mention(uid, name)} больше не админ бота", parse_mode="HTML")
+
+
+@router.message(Command("admins"))
+async def cmd_admins(message: Message, bot: Bot):
+    if not message.from_user or not (
+        is_super(message.from_user.id) or await is_admin(bot, message.chat.id, message.from_user.id)
+    ):
+        await message.reply("Только для админов.")
+        return
+    chat_list = CHAT_ADMINS.get(str(message.chat.id), [])
+    text = "Главные админы: " + (", ".join(f"<code>{i}</code>" for i in sorted(ADMIN_IDS)) or "нет")
+    text += "\nАдмины этого чата: " + (", ".join(f"<code>{i}</code>" for i in chat_list) or "нет")
+    await message.reply(text, parse_mode="HTML")
+
+
+@router.message(Command("warnsall"))
+async def cmd_warnsall(message: Message, bot: Bot):
+    """Список всех, у кого есть предупреждения в этом чате."""
+    if not await check_access(message, bot):
+        return
+    prefix = f"{message.chat.id}:"
+    rows = []
+    for k, n in WARNS.items():
+        if k.startswith(prefix) and n > 0:
+            uid = int(k[len(prefix):])
+            rows.append((n, uid, WARN_NAMES.get(k) or str(uid)))
+    if not rows:
+        await message.reply("В этом чате ни у кого нет предупреждений.")
+        return
+    rows.sort(reverse=True)
+    lines = [f"{i}. {mention(uid, name)} (<code>{uid}</code>): <b>{n}/{WARN_LIMIT}</b>"
+             for i, (n, uid, name) in enumerate(rows[:50], 1)]
+    text = f"⚠️ Предупреждения в этом чате ({len(rows)} чел.):\n\n" + "\n".join(lines)
+    if len(rows) > 50:
+        text += f"\n\n...и ещё {len(rows) - 50}"
+    await message.reply(text[:4000], parse_mode="HTML")
+
+
+@router.message(Command("frozenlist", "frozen"))
+async def cmd_frozenlist(message: Message, bot: Bot):
+    """Кто сейчас заморожен/в муте программно в этом чате."""
+    if not await check_access(message, bot):
+        return
+    prefix = f"{message.chat.id}:"
+    now = time.time()
+    lines = []
+    for k, until in list(FROZEN.items()):
+        if not k.startswith(prefix):
+            continue
+        if until and until < now:
+            continue
+        uid = int(k[len(prefix):])
+        left = "навсегда" if not until else human(timedelta(seconds=until - now))
+        lines.append(f"• {mention(uid, WARN_NAMES.get(k) or str(uid))} (<code>{uid}</code>): {left}")
+    if not lines:
+        await message.reply("Сейчас никто не заморожен.")
+        return
+    await message.reply("🧊 Заморожены (программно):\n\n" + "\n".join(lines)[:4000], parse_mode="HTML")
+
+
+@router.message(Command("clearwarns"))
+async def cmd_clearwarns(message: Message, command: CommandObject, bot: Bot):
+    """Сбросить все предупреждения человеку."""
+    if not await check_access(message, bot):
+        return
+    args = (command.args or "").split()
+    ra = reply_author(message)
+    if ra:
+        uid, name = ra
+    elif args and args[0].lstrip("-").isdigit():
+        uid, name = int(args[0]), args[0]
+    else:
+        await message.reply("Ответь на сообщение человека или укажи ID.")
+        return
+    WARNS[wkey(message.chat.id, uid)] = 0
+    save_warns()
+    await message.reply(f"✅ У {mention(uid, name)} сброшены все предупреждения", parse_mode="HTML")
+
+
+@router.message(Command("warnsreset"))
+async def cmd_warnsreset(message: Message, bot: Bot):
+    """Обнулить предупреждения у ВСЕХ в этом чате (только главные админы)."""
+    if message.chat.type == "private" or not message.from_user or not is_super(message.from_user.id):
+        await message.reply("Только для главных админов, в чате.")
+        return
+    prefix = f"{message.chat.id}:"
+    n = 0
+    for k in list(WARNS):
+        if k.startswith(prefix) and WARNS[k] > 0:
+            WARNS[k] = 0
+            n += 1
+    save_warns()
+    await message.reply(f"✅ Предупреждения сброшены у {n} чел.")
+
+
+@router.message(Command("info"))
+async def cmd_info(message: Message, command: CommandObject, bot: Bot):
+    """Сводка по человеку: ID, варны, фриз, статус админа."""
+    if not await check_access(message, bot):
+        return
+    args = (command.args or "").split()
+    ra = reply_author(message)
+    if ra:
+        uid, name = ra
+    elif args and args[0].lstrip("-").isdigit():
+        uid, name = int(args[0]), args[0]
+    else:
+        uid, name = message.from_user.id, message.from_user.full_name
+    k = wkey(message.chat.id, uid)
+    until = FROZEN.get(k)
+    if k in FROZEN and (not until or until > time.time()):
+        fr = "навсегда" if not until else "ещё " + human(timedelta(seconds=until - time.time()))
+    else:
+        fr = "нет"
+    adm = "да" if await is_admin(bot, message.chat.id, uid) else "нет"
+    await message.reply(
+        f"👤 {mention(uid, name)}\nID: <code>{uid}</code>\n"
+        f"Предупреждения: {WARNS.get(k, 0)}/{WARN_LIMIT}\nЗаморожен: {fr}\nАдмин бота: {adm}",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("del"))
+async def cmd_del(message: Message, bot: Bot):
+    """Удалить сообщение, на которое ответили (и саму команду)."""
+    if not await check_access(message, bot):
+        return
+    r = message.reply_to_message
+    if not r:
+        await message.reply("Ответь командой /del на сообщение, которое нужно удалить.")
+        return
+    try:
+        await bot.delete_message(message.chat.id, r.message_id)
+    except Exception as e:
+        await fail(message, bot, e)
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+@router.message(Command("purge"))
+async def cmd_purge(message: Message, command: CommandObject, bot: Bot):
+    """Удалить последние N сообщений (из тех, что бот видел). /purge 20"""
+    if not await check_access(message, bot):
+        return
+    a = (command.args or "").split()
+    n = int(a[0]) if a and a[0].isdigit() else 0
+    if not 1 <= n <= 100:
+        await message.reply("Укажи число от 1 до 100: /purge 20")
+        return
+    ids = list(CHAT_MSGS.get(message.chat.id, []))[-(n + 1):]  # + сама команда
+    ok = bad = 0
+    last_err = None
+    for mid in reversed(ids):
+        try:
+            await bot.delete_message(message.chat.id, mid)
+            ok += 1
+        except Exception as e:
+            bad += 1
+            last_err = e
+    if ok == 0 and last_err is not None:
+        await fail(message, bot, last_err)
+        return
+    note = f"🧹 Удалено: {ok}" + (f", не удалось: {bad}" if bad else "")
+    await bot.send_message(message.chat.id, note)
+
+
+@router.message(Command("lock"))
+async def cmd_lock(message: Message, bot: Bot):
+    """Режим тишины: бот удаляет сообщения всех не-админов."""
+    if not await check_access(message, bot):
+        return
+    LOCKED.add(message.chat.id)
+    await message.reply("🔒 Чат закрыт: сообщения не-админов удаляются. Открыть: /unlock")
+
+
+@router.message(Command("unlock"))
+async def cmd_unlock(message: Message, bot: Bot):
+    if not await check_access(message, bot):
+        return
+    LOCKED.discard(message.chat.id)
+    await message.reply("🔓 Чат открыт")
+
+
+@router.message(Command("say"))
+async def cmd_say(message: Message, command: CommandObject, bot: Bot):
+    """Бот пишет от своего имени. /say текст"""
+    if not await check_access(message, bot):
+        return
+    if not command.args:
+        await message.reply("Напиши текст: /say всем привет")
+        return
+    await bot.send_message(message.chat.id, command.args)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+@router.message(Command("rules"))
+async def cmd_rules(message: Message):
+    text = RULES.get(str(message.chat.id))
+    await message.reply(text if text else "Правила для этого чата не заданы. Админ: /setrules текст")
+
+
+@router.message(Command("setrules"))
+async def cmd_setrules(message: Message, command: CommandObject, bot: Bot):
+    if not await check_access(message, bot):
+        return
+    if not command.args:
+        await message.reply("Напиши текст правил: /setrules 1. Без спама ...")
+        return
+    RULES[str(message.chat.id)] = command.args
+    try:
+        with open(RULES_FILE, "w", encoding="utf-8") as f:
+            json.dump(RULES, f, ensure_ascii=False)
+    except Exception as e:
+        logging.warning("не удалось сохранить rules.json: %r", e)
+    await message.reply("✅ Правила сохранены. Показать: /rules")
+
+
+@router.message(Command("report"))
+async def cmd_report(message: Message, bot: Bot):
+    """Любой участник жалуется на сообщение (ответом): уйдёт админу в ЛС."""
+    r = message.reply_to_message
+    if not r:
+        await message.reply("Ответь командой /report на сообщение-нарушение.")
+        return
+    ra = reply_author(message)
+    who = f"{ra[1]} ({ra[0]})" if ra else "неизвестно"
+    sender = message.from_user.full_name if message.from_user else "?"
+    await report(
+        bot,
+        f"🚩 Жалоба в чате {message.chat.id} от {sender}\nНа: {who}\n"
+        f"Сообщение #{r.message_id}: {(getattr(r, 'text', None) or '')[:300]}",
+    )
+    await message.reply("✅ Жалоба отправлена админам")
 
 
 @router.message(Command("apicheck"))
@@ -641,6 +1042,13 @@ async def cmd_apiscan(message: Message, bot: Bot):
     await message.reply(text[:4000])
 
 
+@router.error()
+async def on_error(event, bot: Bot):
+    """Любая необработанная ошибка уходит владельцу в ЛС, в чат ничего не пишем."""
+    await report(bot, f"Необработанная ошибка: {event.exception!r}")
+    return True
+
+
 # ---------- веб-сервер для Render / UptimeRobot ----------
 async def start_web():
     from aiohttp import web
@@ -690,12 +1098,58 @@ async def preload_me(bot: Bot):
     logging.info("getMe ok: @%s (%s)", res.get("username"), res["id"])
 
 
+# ---------- устойчивая сессия ----------
+# Приватка присылает не все поля, которые требует свежий aiogram (например, у опроса
+# нет members_only). Из-за одного такого сообщения getUpdates падал в вечный повтор
+# и бот переставал отвечать. Теперь "плохие" апдейты упрощаются, а не ломают всю пачку.
+SAFE_MSG_KEYS = {
+    "message_id", "date", "chat", "from", "sender_chat", "text", "entities",
+    "reply_to_message", "edit_date", "caption", "caption_entities", "message_thread_id",
+}
+MSG_UPDATE_KEYS = ("message", "edited_message", "channel_post", "edited_channel_post")
+
+
+def reduce_update(item: dict) -> dict:
+    out = {"update_id": item.get("update_id")}
+    for k in MSG_UPDATE_KEYS:
+        if isinstance(item.get(k), dict):
+            m = {kk: vv for kk, vv in item[k].items() if kk in SAFE_MSG_KEYS}
+            try:
+                Update.model_validate({"update_id": out["update_id"], k: m})
+                out[k] = m
+            except Exception:
+                pass
+    return out
+
+
+class TolerantSession(AiohttpSession):
+    def check_response(self, bot, method, status_code, content):
+        try:
+            return super().check_response(bot=bot, method=method, status_code=status_code, content=content)
+        except ClientDecodeError:
+            if not isinstance(method, GetUpdates):
+                raise
+            data = json.loads(content)
+            fixed = []
+            for item in data.get("result") or []:
+                try:
+                    Update.model_validate(item)
+                    fixed.append(item)
+                except Exception as e:
+                    logging.warning("апдейт %s упрощён: %s", item.get("update_id"), str(e)[:150])
+                    fixed.append(reduce_update(item))
+            data["result"] = fixed
+            return super().check_response(
+                bot=bot, method=method, status_code=status_code, content=json.dumps(data)
+            )
+
+
 # ---------- запуск ----------
 async def main():
     await start_web()
     asyncio.create_task(keep_alive())
     if API_BASE:
-        session = AiohttpSession(api=TelegramAPIServer.from_base(API_BASE))
+        session = TolerantSession(api=TelegramAPIServer.from_base(API_BASE))
         bot = Bot(TOKEN, session=session)
     else:
         bot = Bot(TOKEN)
